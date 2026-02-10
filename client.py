@@ -1,23 +1,23 @@
 import asyncio
-from typing import Optional
-from contextlib import AsyncExitStack
 import os
-from mcp import ClientSession, StdioServerParameters
-from mcp.client.stdio import stdio_client
+import sys
+from datetime import datetime
 from pathlib import Path
 from anthropic import Anthropic
 from dotenv import load_dotenv
+from fastmcp import Client
+from fastmcp.client.logging import LogMessage
+from fastmcp.client.elicitation import ElicitResult, ElicitRequestParams, RequestContext
 
 load_dotenv()  # load environment variables from .env
 
 # Claude model constant
 ANTHROPIC_MODEL = "claude-sonnet-4-5"
 
+
 class MCPClient:
-    def __init__(self):
-        # Initialize session and client objects
-        self.session: ClientSession | None = None
-        self.exit_stack = AsyncExitStack()
+    def __init__(self, server_path: str):
+        self.server_path = server_path
         self._anthropic: Anthropic | None = None
 
     @property
@@ -26,78 +26,100 @@ class MCPClient:
             self._anthropic = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
         return self._anthropic
 
-    async def connect_to_server(self, server_script_path: str):
-        """Connect to an MCP server
-
-        Args:
-            server_script_path: Path to the server script (.py or .js)
-        """
-        is_python = server_script_path.endswith(".py")
-        if is_python:
-            path = Path(server_script_path).resolve()
-            server_params = StdioServerParameters(
-                command="uv",
-                args=["--directory", str(path.parent), "run", path.name],
-                env=None,
-            )
+    async def handle_elicitation(
+        self,
+        message: str,
+        response_type: type | None,
+        params: ElicitRequestParams,
+        context: RequestContext
+    ) -> ElicitResult | object:
+        """Handle confirmation requests from gNB server"""
+        print(f"\n{'='*60}")
+        print(f"gNB CONFIRMATION REQUIRED")
+        print(f"{'='*60}")
+        print(f"{message}")
+    
+        response = input("\nContinue with this operation? (y/n): ").strip().lower()
+        confirmed = response in ("y", "yes")
+    
+        if confirmed:
+            print("Operation confirmed")
+            # For response_type=None, return None directly (implicit accept)
+            if response_type is None:
+                return None
+            else:
+                return response_type()
         else:
-            server_params = StdioServerParameters(command="node", args=[server_script_path], env=None)
+            print("Operation cancelled")
+            return ElicitResult(action="decline")
 
-        stdio_transport = await self.exit_stack.enter_async_context(stdio_client(server_params))
-        self.stdio, self.write = stdio_transport
-        self.session = await self.exit_stack.enter_async_context(ClientSession(self.stdio, self.write))
+    async def handle_logging(self, message: LogMessage):
+        """Handle log messages from gNB server"""
+        level_name = message.level.upper()
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        
+        log_line = f"[{timestamp}] [gNB-{level_name}] {message.data}"
+        
+        if message.extra:
+            log_line += f" | {message.extra}"
+            
+        print(log_line)
 
-        await self.session.initialize()
-
-        # List available tools
-        response = await self.session.list_tools()
-        tools = response.tools
-        print("\nConnected to server with tools:", [tool.name for tool in tools])
-
-    async def process_query(self, query: str) -> str:
-        """Process a query using Claude and available tools"""
-        messages = [{"role": "user", "content": query}]
-
-        response = await self.session.list_tools()
-        available_tools = [
-            {"name": tool.name, "description": tool.description, "input_schema": tool.inputSchema}
-            for tool in response.tools
-        ]
-
-        # Initial Claude API call
-        response = self.anthropic.messages.create(
-            model=ANTHROPIC_MODEL, max_tokens=1000, messages=messages, tools=available_tools
+    def create_client(self) -> Client:
+        """Create FastMCP client with handlers"""
+        return Client(
+            self.server_path,
+            elicitation_handler=self.handle_elicitation,
+            log_handler=self.handle_logging
         )
 
-        # Process response and handle tool calls
-        final_text = []
+    async def process_query(self, client: Client, query: str) -> str:
+        """Process a query using Claude and available tools"""
+        
+        async with client:
+            messages = [{"role": "user", "content": query}]
 
-        for content in response.content:
-            if content.type == "text":
-                final_text.append(content.text)
-            elif content.type == "tool_use":
-                tool_name = content.name
-                tool_args = content.input
+            # Get available tools using FastMCP
+            tools_response = await client.list_tools()
+            available_tools = [
+                {"name": tool.name, "description": tool.description, "input_schema": tool.inputSchema}
+                for tool in tools_response
+            ]
 
-                # Execute tool call
-                result = await self.session.call_tool(tool_name, tool_args)
-                final_text.append(f"[Calling tool {tool_name} with args {tool_args}]")
+            # Initial Claude API call
+            response = self.anthropic.messages.create(
+                model=ANTHROPIC_MODEL, max_tokens=1000, messages=messages, tools=available_tools
+            )
 
-                # Continue conversation with tool results
-                if hasattr(content, "text") and content.text:
-                    messages.append({"role": "assistant", "content": content.text})
-                messages.append({"role": "user", "content": result.content})
+            # Process response and handle tool calls
+            final_text = []
 
-                # Get next response from Claude
-                response = self.anthropic.messages.create(
-                    model=ANTHROPIC_MODEL,
-                    max_tokens=1000,
-                    messages=messages,
-                )
+            for content in response.content:
+                if content.type == "text":
+                    final_text.append(content.text)
+                elif content.type == "tool_use":
+                    tool_name = content.name
+                    tool_args = content.input
 
-                final_text.append(response.content[0].text)
+                    # Execute tool call using FastMCP
+                    result = await client.call_tool(tool_name, tool_args)
+                    final_text.append(f"[Calling tool {tool_name} with args {tool_args}]")
 
-        return "\n".join(final_text)
+                    # Continue conversation with tool results
+                    if hasattr(content, "text") and content.text:
+                        messages.append({"role": "assistant", "content": content.text})
+                    messages.append({"role": "user", "content": str(result.content)})
+
+                    # Get next response from Claude
+                    response = self.anthropic.messages.create(
+                        model=ANTHROPIC_MODEL,
+                        max_tokens=1000,
+                        messages=messages,
+                    )
+
+                    final_text.append(response.content[0].text)
+
+            return "\n".join(final_text)
 
     async def chat_loop(self):
         """Run an interactive chat loop"""
@@ -111,15 +133,11 @@ class MCPClient:
                 if query.lower() == "quit":
                     break
 
-                response = await self.process_query(query)
+                response = await self.process_query(self.client,query)
                 print("\n" + response)
 
             except Exception as e:
                 print(f"\nError: {str(e)}")
-
-    async def cleanup(self):
-        """Clean up resources"""
-        await self.exit_stack.aclose()
 
 
 async def main():
@@ -127,20 +145,23 @@ async def main():
         print("Usage: python client.py <path_to_server_script>")
         sys.exit(1)
 
-    client = MCPClient()
-    try:
-        await client.connect_to_server(sys.argv[1])
+    server_path = sys.argv[1]
+    client = MCPClient(server_path)
+    
+    # Check if we have a valid API key to continue
+    api_key = os.getenv("ANTHROPIC_API_KEY")
+    if not api_key:
+        print("\nNo ANTHROPIC_API_KEY found. To query these tools with Claude, set your API key:")
+        print("  export ANTHROPIC_API_KEY=your-api-key-here")
+        return
 
-        # Check if we have a valid API key to continue
-        api_key = os.getenv("ANTHROPIC_API_KEY")
-        if not api_key:
-            print("\nNo ANTHROPIC_API_KEY found. To query these tools with Claude, set your API key:")
-            print("  export ANTHROPIC_API_KEY=your-api-key-here")
-            return
+    # Test connection and show available tools
+    test_client = client.create_client()
+    async with test_client:
+        tools = await test_client.list_tools()
+        print(f"\nConnected to server with tools: {[tool.name for tool in tools]}")
 
-        await client.chat_loop()
-    finally:
-        await client.cleanup()
+    await client.chat_loop()
 
 
 if __name__ == "__main__":
