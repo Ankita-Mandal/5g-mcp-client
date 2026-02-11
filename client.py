@@ -9,16 +9,13 @@ from fastmcp import Client
 from fastmcp.client.logging import LogMessage
 from fastmcp.client.elicitation import ElicitResult, ElicitRequestParams, RequestContext
 
-load_dotenv()  # load environment variables from .env
-
-# Claude model constant
+load_dotenv()
 ANTHROPIC_MODEL = "claude-sonnet-4-5"
 
-
 class MCPClient:
-    def __init__(self, server_path: str):
-        self.server_path = server_path
+    def __init__(self):
         self._anthropic: Anthropic | None = None
+        self.conversation_history = []
 
     @property
     def anthropic(self) -> Anthropic:
@@ -26,20 +23,15 @@ class MCPClient:
             self._anthropic = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
         return self._anthropic
 
-    async def handle_elicitation(
-        self,
-        message: str,
-        response_type: type | None,
-        params: ElicitRequestParams,
-        context: RequestContext
-    ) -> ElicitResult | object:
+    async def handle_elicitation(self, message: str, response_type: type | None, params: ElicitRequestParams, context: RequestContext) -> ElicitResult | object:
         """Handle confirmation requests from gNB server"""
+        #TODO: Confirmation by button click on the Glasses
         print(f"\n{'='*60}")
         print(f"gNB CONFIRMATION REQUIRED")
         print(f"{'='*60}")
         print(f"{message}")
     
-        response = input("\nContinue with this operation? (y/n): ").strip().lower()
+        response = input("\nContinue with this operation? (y/n): ").strip().lower() #TODO: Replace with button click
         confirmed = response in ("y", "yes")
     
         if confirmed:
@@ -65,67 +57,60 @@ class MCPClient:
             
         print(log_line)
 
-    def create_client(self) -> Client:
-        """Create FastMCP client with handlers"""
-        return Client(
-            self.server_path,
-            elicitation_handler=self.handle_elicitation,
-            log_handler=self.handle_logging
-        )
-
-    async def process_query(self, client: Client, query: str) -> str:
+    async def process_query(self, client: Client, query: str, tools: list) -> str:
         """Process a query using Claude and available tools"""
         
-        async with client:
-            messages = [{"role": "user", "content": query}]
-
-            # Get available tools using FastMCP
-            tools_response = await client.list_tools()
-            available_tools = [
-                {"name": tool.name, "description": tool.description, "input_schema": tool.inputSchema}
-                for tool in tools_response
-            ]
-
-            # Initial Claude API call
-            response = self.anthropic.messages.create(
-                model=ANTHROPIC_MODEL, max_tokens=1000, messages=messages, tools=available_tools
+        # 1. Add user query
+        self.conversation_history.append({"role": "user", "content": query})
+        
+        # 2. Get Claude's response
+        response = self.anthropic.messages.create(
+            model=ANTHROPIC_MODEL, 
+            max_tokens=1000, 
+            messages=self.conversation_history, 
+            tools=tools
+        )
+        
+        # 3. Add Claude's response to history (including tool calls)
+        self.conversation_history.append({"role": "assistant", "content": response.content})
+        
+        # Collect tool calls and prepare display text
+        tool_calls = [content for content in response.content if content.type == "tool_use"]
+        final_text = [content.text for content in response.content if content.type == "text"]
+        
+        # 4. Execute tools and add results
+        if tool_calls:
+            tool_results = []
+            for tool_call in tool_calls:
+                result = await client.call_tool(tool_call.name, tool_call.input)
+                final_text.append(f"[Calling tool {tool_call.name} with args {tool_call.input}]")
+                
+                tool_results.append({
+                    "type": "tool_result",
+                    "tool_use_id": tool_call.id,
+                    "content": result.content
+                })
+            
+            # Add ALL tool results as one user message
+            self.conversation_history.append({"role": "user", "content": tool_results})
+            
+            # 5. Get Claude's final interpretation
+            final_response = self.anthropic.messages.create(
+                model=ANTHROPIC_MODEL,
+                max_tokens=1000,
+                messages=self.conversation_history,
             )
+            
+            self.conversation_history.append({"role": "assistant", "content": final_response.content})
+            final_text.extend([content.text for content in final_response.content if content.type == "text"])
 
-            # Process response and handle tool calls
-            final_text = []
+        return "\n".join(final_text)
 
-            for content in response.content:
-                if content.type == "text":
-                    final_text.append(content.text)
-                elif content.type == "tool_use":
-                    tool_name = content.name
-                    tool_args = content.input
-
-                    # Execute tool call using FastMCP
-                    result = await client.call_tool(tool_name, tool_args)
-                    final_text.append(f"[Calling tool {tool_name} with args {tool_args}]")
-
-                    # Continue conversation with tool results
-                    if hasattr(content, "text") and content.text:
-                        messages.append({"role": "assistant", "content": content.text})
-                    messages.append({"role": "user", "content": str(result.content)})
-
-                    # Get next response from Claude
-                    response = self.anthropic.messages.create(
-                        model=ANTHROPIC_MODEL,
-                        max_tokens=1000,
-                        messages=messages,
-                    )
-
-                    final_text.append(response.content[0].text)
-
-            return "\n".join(final_text)
-
-    async def chat_loop(self):
+    async def chat_loop(self, client: Client, available_tools: list):
         """Run an interactive chat loop"""
         print("\nMCP Client Started!")
         print("Type your queries or 'quit' to exit.")
-
+        #TODO: Add voice input to prompt text / process_query pipeline
         while True:
             try:
                 query = input("\nQuery: ").strip()
@@ -133,7 +118,7 @@ class MCPClient:
                 if query.lower() == "quit":
                     break
 
-                response = await self.process_query(self.client,query)
+                response = await self.process_query(client, query, available_tools)
                 print("\n" + response)
 
             except Exception as e:
@@ -141,30 +126,33 @@ class MCPClient:
 
 
 async def main():
-    if len(sys.argv) < 2:
-        print("Usage: python client.py <path_to_server_script>")
-        sys.exit(1)
-
-    server_path = sys.argv[1]
-    client = MCPClient(server_path)
-    
-    # Check if we have a valid API key to continue
+    # Check if we have a valid API key before connecting
     api_key = os.getenv("ANTHROPIC_API_KEY")
     if not api_key:
         print("\nNo ANTHROPIC_API_KEY found. To query these tools with Claude, set your API key:")
-        print("  export ANTHROPIC_API_KEY=your-api-key-here")
         return
 
-    # Test connection and show available tools
-    test_client = client.create_client()
-    async with test_client:
-        tools = await test_client.list_tools()
+    # Create MCPClient instance once
+    mcp_client = MCPClient()
+    
+    async with Client("../ar_gnb_server/server.py", elicitation_handler=mcp_client.handle_elicitation) as client:
+        await client.ping()
+
+        # List available operations
+        tools = await client.list_tools()
+        available_tools = [
+            {"name": tool.name, "description": tool.description, "input_schema": tool.inputSchema}
+            for tool in tools
+        ]
+        resources = await client.list_resources()
+        prompts = await client.list_prompts()
+
         print(f"\nConnected to server with tools: {[tool.name for tool in tools]}")
+        print(f"\nConnected to server with resources: {[resource.name for resource in resources]}")
+        print(f"\nConnected to server with prompts: {[prompt.name for prompt in prompts]}")
 
-    await client.chat_loop()
-
+        # Start chat loop with the connected client
+        await mcp_client.chat_loop(client, available_tools)
 
 if __name__ == "__main__":
-    import sys
-
     asyncio.run(main())
