@@ -8,6 +8,8 @@ from dotenv import load_dotenv
 from fastmcp import Client
 from fastmcp.client.logging import LogMessage
 from fastmcp.client.elicitation import ElicitResult, ElicitRequestParams, RequestContext
+from fastmcp.client.transports import StreamableHttpTransport
+from fastmcp.client.transports import StdioTransport
 
 load_dotenv()
 ANTHROPIC_MODEL = "claude-sonnet-4-5"
@@ -66,7 +68,11 @@ class MCPClient:
         # 2. Get Claude's response
         response = self.anthropic.messages.create(
             model=ANTHROPIC_MODEL, 
-            max_tokens=1000, 
+            max_tokens=7000,
+            # thinking={
+            #     "type": "enabled",
+            #     "budget_tokens": 3200 # Recommended: 1/4 to 1/2 of max_tokens
+            # }, 
             messages=self.conversation_history, 
             tools=tools
         )
@@ -97,7 +103,11 @@ class MCPClient:
             # 5. Get Claude's final interpretation
             final_response = self.anthropic.messages.create(
                 model=ANTHROPIC_MODEL,
-                max_tokens=1000,
+                max_tokens=7000,
+                thinking={
+                    "type": "enabled",
+                    "budget_tokens": 3200 # Recommended: 1/4 to 1/2 of max_tokens
+                }, 
                 messages=self.conversation_history,
             )
             
@@ -135,10 +145,31 @@ async def main():
     # Create MCPClient instance once
     mcp_client = MCPClient()
     
-    async with Client("../ar_gnb_server/server.py", elicitation_handler=mcp_client.handle_elicitation) as client:
+    # Configure multiple transports
+    config = {
+        "mcpServers": {
+            # "usrp_gnb_server": {
+            #     "command": "python",
+            #     "args": ["../ar_gnb_server/server.py"],
+            #     "env": {
+            #         "OAI_DOCUMENTATION_DIR": "/home/xmili/Documents/Abhiram/USRPworkarea/oai-setup/openairinterface5g/doc",
+            #         "ANTHROPIC_API_KEY": api_key
+            #     }
+            # },
+            "remote_x5g_server": {
+                "url": "http://localhost:8080/mcp",
+                "transport": "http",
+                "headers": {
+                    "Content-Type": "application/json"
+                }
+            }
+        }
+    }
+    
+    async with Client(config, elicitation_handler=mcp_client.handle_elicitation) as client:
         await client.ping()
 
-        # List available operations
+        # List available operations (tools will now be namespaced)
         tools = await client.list_tools()
         available_tools = [
             {"name": tool.name, "description": tool.description, "input_schema": tool.inputSchema}
@@ -147,10 +178,13 @@ async def main():
         resources = await client.list_resources()
         prompts = await client.list_prompts()
 
-        print(f"\nConnected to server with tools: {[tool.name for tool in tools]}")
-        print(f"\nConnected to server with resources: {[resource.name for resource in resources]}")
-        print(f"\nConnected to server with prompts: {[prompt.name for prompt in prompts]}")
-
+        server_names = list(config["mcpServers"].keys())
+        primary_server = server_names[0] if server_names else "unknown"
+ 
+        print(f"\nConnected to '{primary_server}' with tools: {[tool.name for tool in tools]}")
+        print(f"\nConnected to '{primary_server}' with resources: {[resource.name for resource in resources]}")
+        print(f"\nConnected to '{primary_server}' with prompts: {[prompt.name for prompt in prompts]}")
+        
         # Start chat loop with the connected client
         await mcp_client.chat_loop(client, available_tools)
 
