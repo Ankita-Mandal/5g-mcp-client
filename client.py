@@ -47,49 +47,67 @@ class MCPClient:
             print("Operation cancelled")
             return ElicitResult(action="decline")
 
-    async def handle_logging(self, message: LogMessage):
-        """Handle log messages from gNB server"""
+    def handle_logging(self, message: LogMessage):
+        """Handle log messages from gNB server with enhanced display"""
         level_name = message.level.upper()
         timestamp = datetime.now().strftime("%H:%M:%S")
-        
-        log_line = f"[{timestamp}] [gNB-{level_name}] {message.data}"
-        
+    
+        # Enhanced formatting for different log levels
+        if level_name == "INFO":
+            log_line = f"[{timestamp}] [SERVER-{level_name}] {message.data}"
+        elif level_name == "ERROR":
+            log_line = f"[{timestamp}] [SERVER-{level_name}] {message.data}"
+        elif level_name == "WARNING":
+            log_line = f"[{timestamp}] [SERVER-{level_name}] {message.data}"
+        else:
+            log_line = f"[{timestamp}] [SERVER-{level_name}] {message.data}"
+    
         if message.extra:
             log_line += f" | {message.extra}"
-            
-        print(log_line)
+            print(log_line)
 
     async def process_query(self, client: Client, query: str, tools: list) -> str:
-        """Process a query using Claude and available tools"""
+        """Process a query using Claude and available tools with real-time intermediate display"""
         
         # 1. Add user query
         self.conversation_history.append({"role": "user", "content": query})
         
-        # 2. Get Claude's response
+        # 2. Get Claude's initial response
+        print("\nClaude: ")
         response = self.anthropic.messages.create(
             model=ANTHROPIC_MODEL, 
             max_tokens=7000,
-            # thinking={
-            #     "type": "enabled",
-            #     "budget_tokens": 3200 # Recommended: 1/4 to 1/2 of max_tokens
-            # }, 
             messages=self.conversation_history, 
             tools=tools
         )
-        
-        # 3. Add Claude's response to history (including tool calls)
+        print(f"Input tokens: {response.usage.input_tokens}")
+        print(f"Output tokens: {response.usage.output_tokens}")
+        # 3. Add Claude's response to history
         self.conversation_history.append({"role": "assistant", "content": response.content})
         
-        # Collect tool calls and prepare display text
-        tool_calls = [content for content in response.content if content.type == "tool_use"]
-        final_text = [content.text for content in response.content if content.type == "text"]
+        # Display initial text content immediately
+        initial_text = [content.text for content in response.content if content.type == "text"]
+        if initial_text:
+            print("\n".join(initial_text))
         
-        # 4. Execute tools and add results
+        # Check for tool calls
+        tool_calls = [content for content in response.content if content.type == "tool_use"]
+        
+        # 4. Execute tools and show real-time results
         if tool_calls:
+            print(f"\n** Tool Execution ({len(tool_calls)} tool(s)):**")
             tool_results = []
-            for tool_call in tool_calls:
+            
+            for i, tool_call in enumerate(tool_calls, 1):
+                print(f"\n[{i}] Calling tool '{tool_call.name}' with args: {tool_call.input}")
+                
+                # Execute tool and show result immediately
                 result = await client.call_tool(tool_call.name, tool_call.input)
-                final_text.append(f"[Calling tool {tool_call.name} with args {tool_call.input}]")
+                print(f"[{i}] Tool '{tool_call.name}' completed")
+                
+                # Show a preview of the result if it's not too long
+                result_preview = str(result.content)[:200] + "..." if len(str(result.content)) > 200 else str(result.content)
+                print(f"[{i}] Result preview: {result_preview}")
                 
                 tool_results.append({
                     "type": "tool_result",
@@ -100,40 +118,52 @@ class MCPClient:
             # Add ALL tool results as one user message
             self.conversation_history.append({"role": "user", "content": tool_results})
             
-            # 5. Get Claude's final interpretation
+            # 5. Get Claude's final analysis
+            print(f"\n** Claude's Analysis of Tool Results:**")
             final_response = self.anthropic.messages.create(
                 model=ANTHROPIC_MODEL,
                 max_tokens=7000,
                 thinking={
                     "type": "enabled",
-                    "budget_tokens": 3200 # Recommended: 1/4 to 1/2 of max_tokens
+                    "budget_tokens": 3200
                 }, 
                 messages=self.conversation_history,
             )
-            
+            print(f"Input tokens: {final_response.usage.input_tokens}")
+            print(f"Output tokens: {final_response.usage.output_tokens}")
             self.conversation_history.append({"role": "assistant", "content": final_response.content})
-            final_text.extend([content.text for content in final_response.content if content.type == "text"])
+            final_analysis = [content.text for content in final_response.content if content.type == "text"]
+            
+            if final_analysis:
+                print("\n".join(final_analysis))
+            
+            # Return combined response for history
+            return "\n".join(initial_text + [f"[Tool: {tc.name}]" for tc in tool_calls] + final_analysis)
+        
+        else:
+            # No tools called, just return the initial response
+            return "\n".join(initial_text)
 
-        return "\n".join(final_text)
 
     async def chat_loop(self, client: Client, available_tools: list):
-        """Run an interactive chat loop"""
+        """Run an interactive chat loop with real-time display"""
         print("\nMCP Client Started!")
         print("Type your queries or 'quit' to exit.")
-        #TODO: Add voice input to prompt text / process_query pipeline
+    
         while True:
             try:
                 query = input("\nQuery: ").strip()
-
+            
                 if query.lower() == "quit":
                     break
 
-                response = await self.process_query(client, query, available_tools)
-                print("\n" + response)
+                # Process query with real-time display (no need to print response)
+                await self.process_query(client, query, available_tools)
+            
+                print("\n" + "="*60)  # Separator between queries
 
             except Exception as e:
-                print(f"\nError: {str(e)}")
-
+                print(f"Error: {e}")
 
 async def main():
     # Check if we have a valid API key before connecting
