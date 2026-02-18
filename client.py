@@ -178,14 +178,14 @@ async def main():
     # Configure multiple transports
     config = {
         "mcpServers": {
-            # "usrp_gnb_server": {
-            #     "command": "python",
-            #     "args": ["../ar_gnb_server/server.py"],
-            #     "env": {
-            #         "OAI_DOCUMENTATION_DIR": "/home/xmili/Documents/Abhiram/USRPworkarea/oai-setup/openairinterface5g/doc",
-            #         "ANTHROPIC_API_KEY": api_key
-            #     }
-            # },
+            "usrp_gnb_server": {
+                "command": "python",
+                "args": ["../ar_gnb_server/server.py"],
+                "env": {
+                    "OAI_DOCUMENTATION_DIR": "/home/xmili/Documents/Abhiram/USRPworkarea/oai-setup/openairinterface5g/doc",
+                    "ANTHROPIC_API_KEY": api_key
+                }
+            },
             "remote_x5g_server": {
                 "url": "http://localhost:8080/mcp",
                 "transport": "http",
